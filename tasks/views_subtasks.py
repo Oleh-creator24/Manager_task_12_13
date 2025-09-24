@@ -1,4 +1,4 @@
-# tasks/views_subtasks.py
+
 from django.utils.decorators import method_decorator
 from django.views.decorators.csrf import csrf_exempt
 
@@ -6,38 +6,71 @@ from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status as http_status
 from rest_framework.permissions import AllowAny
-from rest_framework.authentication import SessionAuthentication
 
-from .models import SubTask, Task, Status
+from .models import SubTask
 from .serializers import (
     SubTaskCreateSerializer,
     SubTaskDetailSerializer,
 )
 
-# Отключаем CSRF для удобства тестов из PowerShell/скриптов
 @method_decorator(csrf_exempt, name="dispatch")
 class SubTaskListCreateView(APIView):
-    authentication_classes = []        # без SessionAuthentication => нет CSRF
+    """
+    GET /api/subtasks/
+      Параметры:
+        - page (int, >=1), по умолчанию 1
+        - page_size (опционально, но мы принудительно ограничиваем до 5)
+        - task_id (int) — фильтр по задаче
+        - task_title (str) — фильтр по названию задачи (contains, case-insensitive)
+        - status (str) — фильтр по названию статуса подзадачи (exact, case-insensitive)
+      Сортировка: по -created_at (последние сначала)
+      Пагинация: не более 5 на страницу
+    POST /api/subtasks/ — создать подзадачу
+    """
+    authentication_classes = []
     permission_classes = [AllowAny]
 
     def get(self, request):
-        """
-        ?task_id=<int> — вернуть подзадачи конкретной задачи
-        без параметра — вернуть все подзадачи
-        """
+        qs = SubTask.objects.all().select_related('task', 'status').order_by('-created_at')
+
+        # ---- Задание 3: фильтрация по task_title и status ----
         task_id = request.GET.get('task_id')
-        qs = SubTask.objects.all().select_related('task', 'status')
+        task_title = request.GET.get('task_title')
+        status_name = request.GET.get('status')
+
         if task_id:
             qs = qs.filter(task_id=task_id)
-        data = SubTaskDetailSerializer(qs, many=True).data
-        return Response(data, status=http_status.HTTP_200_OK)
+        if task_title:
+            qs = qs.filter(task__title__icontains=task_title.strip())
+        if status_name:
+            qs = qs.filter(status__name__iexact=status_name.strip())
+
+        # ---- Задание 2: пагинация 5 шт. на страницу ----
+        # page_size игнорируем (жёстко 5), но корректно парсим page
+        def to_int(v, default):
+            try:
+                iv = int(v)
+                return iv if iv >= 1 else default
+            except Exception:
+                return default
+
+        page = to_int(request.GET.get('page'), 1)
+        page_size = 5
+        total = qs.count()
+        start = (page - 1) * page_size
+        end = start + page_size
+
+        items = list(qs[start:end])
+        data = SubTaskDetailSerializer(items, many=True).data
+
+        return Response({
+            "count": total,
+            "page": page,
+            "page_size": page_size,
+            "results": data
+        }, status=http_status.HTTP_200_OK)
 
     def post(self, request):
-        """
-        Создать подзадачу.
-        Ожидает: title, description?, deadline, task_id, status_id?
-        Поле created_at — read_only (игнорируется, если передать).
-        """
         serializer = SubTaskCreateSerializer(data=request.data)
         if serializer.is_valid():
             subtask = serializer.save()
@@ -48,7 +81,7 @@ class SubTaskListCreateView(APIView):
 
 @method_decorator(csrf_exempt, name="dispatch")
 class SubTaskDetailUpdateDeleteView(APIView):
-    authentication_classes = []   # без CSRF
+    authentication_classes = []
     permission_classes = [AllowAny]
 
     def get_object(self, pk):

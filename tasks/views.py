@@ -10,46 +10,63 @@ from django.shortcuts import get_object_or_404
 from django.db.models import Count, Q
 from .serializers import (TaskCreateSerializer, SubTaskCreateSerializer, SubTaskDetailSerializer,
                           TaskDetailSerializer,)
+from django.db.models.functions import ExtractWeekDay
+from django.http import JsonResponse
+from .serializers import TaskShallowSerializer
+from django.db.models.functions import ExtractWeekDay
+from django.views.decorators.http import require_http_methods
+from django.views.decorators.http import require_http_methods
+from django.db.models.functions import ExtractWeekDay
+
+from .utils import json_ok, json_error, parse_json_body
+
 
 
 def task_list_html(request):
-    """HTML страница со списком задач"""
+    from .models import Task
     tasks = Task.objects.all()
     return render(request, 'tasks/task_list.html', {'tasks': tasks})
+
 
 
 @csrf_exempt
 @require_http_methods(["POST"])
 def api_create_task(request):
-    """API эндпоинт для создания задачи — теперь через TaskCreateSerializer с проверкой deadline."""
-    try:
-        data = json.loads(request.body)
+    """API эндпоинт для создания задачи (ввод/вывод строго UTF-8 JSON)."""
+    from .models import Task, Status
 
-        serializer = TaskCreateSerializer(data=data)
-        if serializer.is_valid():
-            task = serializer.save()  # если status присылаешь строкой — лучше маппить во view/сериализаторе отдельно
-            return JsonResponse({
-                'message': 'Task created successfully',
-                'task': {
-                    'id': task.id,
-                    'title': task.title,
-                    'description': task.description,
-                    'status': task.status.name if getattr(task, "status", None) else None,
-                    'deadline': task.deadline.isoformat() if task.deadline else None
-                }
-            }, status=201, json_dumps_params={'ensure_ascii': False})
+    ok, data = parse_json_body(request)
+    if not ok:
+        return json_error(data, status=400)
 
-        # Ошибки валидации DRF (включая "Нельзя устанавливать дедлайн в прошлом.")
-        return JsonResponse({'error': serializer.errors}, status=400,
-                            json_dumps_params={'ensure_ascii': False})
+    title = data.get('title')
+    deadline = data.get('deadline')
+    if not title:
+        return json_error({'error': 'Title is required'}, status=400)
+    if not deadline:
+        return json_error({'error': 'Deadline is required'}, status=400)
 
-    except json.JSONDecodeError:
-        return JsonResponse({'error': 'Invalid JSON'}, status=400,
-                            json_dumps_params={'ensure_ascii': False})
-    except Exception as e:
-        return JsonResponse({'error': str(e)}, status=500,
-                            json_dumps_params={'ensure_ascii': False})
+    status_name = data.get('status', 'To Do')
+    status, _ = Status.objects.get_or_create(name=status_name)
 
+    task = Task.objects.create(
+        title=title,
+        description=data.get('description', ''),
+        status=status,
+        deadline=deadline,
+    )
+    task.refresh_from_db()
+
+    return json_ok({
+        'message': 'Task created successfully',
+        'task': {
+            'id': task.id,
+            'title': task.title,
+            'description': task.description,
+            'status': task.status.name,
+            'deadline': task.deadline.isoformat() if task.deadline else None,
+        }
+    }, status=201)
 # def api_create_task(request):
 #     """API эндпоинт для создания задачи"""
 #     try:
@@ -100,15 +117,38 @@ def api_create_task(request):
 #         return JsonResponse({'error': str(e)}, status=500,
 #                             json_dumps_params={'ensure_ascii': False})
 
-
 @require_http_methods(["GET"])
-def api_task_detail(request, task_id):
-    """
-    Детали задачи: используем TaskDetailSerializer (задание 3).
-    """
-    task = get_object_or_404(Task, id=task_id)
-    serializer = TaskDetailSerializer(task)
-    return JsonResponse(serializer.data, json_dumps_params={'ensure_ascii': False})
+def api_task_list(request):
+    """Список задач (фильтры/сортировки как у тебя были)."""
+    from django.utils import timezone
+    from .models import Task
+
+    tasks = Task.objects.all().order_by('-deadline')
+    status_filter = request.GET.get('status')
+    if status_filter:
+        tasks = tasks.filter(status__name=status_filter)
+
+    overdue = request.GET.get('overdue')
+    if overdue and overdue.lower() == 'true':
+        tasks = tasks.filter(deadline__lt=timezone.now())
+
+    tasks_data = []
+    now = timezone.now()
+    for t in tasks:
+        tasks_data.append({
+            'id': t.id,
+            'title': t.title,
+            'description': t.description,
+            'status': t.status.name,
+            'deadline': t.deadline.isoformat() if t.deadline else None,
+            'is_overdue': bool(t.deadline and t.deadline < now)
+        })
+
+    return json_ok({
+        'tasks': tasks_data,
+        'count': len(tasks_data),
+        'filters': {'status': status_filter, 'overdue': overdue}
+    })
 
 # def api_task_list(request):
 #     """API для получения списка задач"""
@@ -129,30 +169,29 @@ def api_task_detail(request, task_id):
 
 @require_http_methods(["GET"])
 def api_task_detail(request, task_id):
-    """API для получения деталей конкретной задачи по ID"""
+    """Детали задачи + подзадачи."""
+    from django.shortcuts import get_object_or_404
+    from .models import Task
+
     task = get_object_or_404(Task, id=task_id)
-    serializer = TaskDetailSerializer(task)
-    return JsonResponse(serializer.data, json_dumps_params={'ensure_ascii': False})
-    # task_data = {
-    #     'id': task.id,
-    #     'title': task.title,
-    #     'description': task.description,
-    #     'status': task.status.name,
-    #     'deadline': task.deadline.isoformat() if task.deadline else None,
-    #     'subtasks': []
-    # }
-
-
-    # for subtask in task.subtasks.all():
-    #     task_data['subtasks'].append({
-    #         'id': subtask.id,
-    #         'title': subtask.title,
-    #         'description': subtask.description,
-    #         'status': subtask.status.name,
-    #         'deadline': subtask.deadline.isoformat() if subtask.deadline else None
-    #     })
-    #
-    # return JsonResponse(task_data, json_dumps_params={'ensure_ascii': False})
+    data = {
+        'id': task.id,
+        'title': task.title,
+        'description': task.description,
+        'status': task.status.name,
+        'deadline': task.deadline.isoformat() if task.deadline else None,
+        'subtasks': [
+            {
+                'id': s.id,
+                'title': s.title,
+                'description': s.description,
+                'status': s.status.name,
+                'deadline': s.deadline.isoformat() if s.deadline else None,
+            }
+            for s in task.subtasks.all()
+        ],
+    }
+    return json_ok(data)
 
 
 @require_http_methods(["GET"])
@@ -316,3 +355,81 @@ def api_task_subtasks(request, task_id):
     serializer = SubTaskDetailSerializer(subtasks, many=True)
     return JsonResponse({'subtasks': serializer.data, 'task_id': task_id},
                         json_dumps_params={'ensure_ascii': False})
+# маппинг названия дня к номеру для ExtractWeekDay (1=Sunday ... 7=Saturday)
+DAY_MAPS = {
+    "понедельник": 2, "вторник": 3, "среда": 4, "четверг": 5, "пятница": 6, "суббота": 7, "воскресенье": 1,
+    "понеділок": 2, "вівторок": 3, "середа": 4, "четвер": 5, "пʼятниця": 6, "пятниця": 6, "субота": 7, "неділя": 1,
+    "monday": 2, "tuesday": 3, "wednesday": 4, "thursday": 5, "friday": 6, "saturday": 7, "sunday": 1,
+}
+
+def _parse_weekday_param(raw):
+    if raw is None or str(raw).strip() == "":
+        return None
+    s = str(raw).strip().lower()
+    if s.isdigit():
+        n = int(s)
+        if 0 <= n <= 6:           # Python Monday=0..Sunday=6 -> Django Sunday=1..Saturday=7
+            return 1 if n == 6 else n + 2
+        if 1 <= n <= 7:
+            return n
+    return DAY_MAPS.get(s)
+
+@require_http_methods(["GET"])
+def api_tasks_by_weekday(request):
+    """GET /api/tasks/by-weekday/?day=вторник — без day вернёт все задачи."""
+    from .models import Task
+    from .serializers import TaskShallowSerializer
+
+    day_param = request.GET.get("day")
+    wday = _parse_weekday_param(day_param)
+
+    qs = Task.objects.all()
+    if wday is not None:
+        qs = qs.annotate(wd=ExtractWeekDay("deadline")).filter(wd=wday)
+
+    data = TaskShallowSerializer(qs, many=True).data
+    from django.http import JsonResponse
+    return JsonResponse(
+        {"count": len(data), "day": day_param, "tasks": data},
+        status=200,
+        json_dumps_params={"ensure_ascii": False}
+    )
+DAY_MAPS = {
+    "понедельник": 2, "вторник": 3, "среда": 4, "четверг": 5, "пятница": 6, "суббота": 7, "воскресенье": 1,
+    "понеділок": 2, "вівторок": 3, "середа": 4, "четвер": 5, "пʼятниця": 6, "пятниця": 6, "субота": 7, "неділя": 1,
+    "monday": 2, "tuesday": 3, "wednesday": 4, "thursday": 5, "friday": 6, "saturday": 7, "sunday": 1,
+}
+
+def _parse_weekday_param(raw):
+    if raw is None or str(raw).strip() == "":
+        return None
+    s = str(raw).strip().lower()
+    if s.isdigit():
+        n = int(s)
+        if 0 <= n <= 6:           # Python Monday=0..Sunday=6 -> Django Sunday=1..Saturday=7
+            return 1 if n == 6 else n + 2
+        if 1 <= n <= 7:
+            return n
+    return DAY_MAPS.get(s)
+
+@require_http_methods(["GET"])
+def api_tasks_by_weekday(request):
+    """GET /api/tasks/by-weekday/?day=вторник — без day вернёт все задачи."""
+    from .models import Task
+    from .serializers import TaskShallowSerializer
+    from django.http import JsonResponse
+
+    day_param = request.GET.get("day")
+    wday = _parse_weekday_param(day_param)
+
+    qs = Task.objects.all()
+    if wday is not None:
+        qs = qs.annotate(wd=ExtractWeekDay("deadline")).filter(wd=wday)
+
+    data = TaskShallowSerializer(qs, many=True).data
+    return JsonResponse(
+        {"count": len(data), "day": day_param, "tasks": data},
+        status=200,
+        json_dumps_params={"ensure_ascii": False}
+    )
+
